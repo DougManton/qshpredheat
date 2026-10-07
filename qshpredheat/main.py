@@ -95,8 +95,12 @@ def extract_forecast_loads(snapshot):
     loads = {}
     for key, value in snapshot.items():
         match = FORECAST_LOAD_RE.match(key)
-        if match and isinstance(value, (int, float)):
-            loads[int(match.group(1))] = float(value)
+        if not match:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            log.debug("%s present but not a usable number: %r (type=%s)", key, value, type(value).__name__)
+            continue
+        loads[int(match.group(1))] = float(value)
     return loads
 
 
@@ -112,7 +116,11 @@ def handle_snapshot(payload):
 
     loads = extract_forecast_loads(snapshot)
     if not loads:
-        log.warning("No forecast_load_kwh_<N>h fields found; raw snapshot keys=%s", list(snapshot.keys()))
+        diag = {k: snapshot.get(k) for k in snapshot if FORECAST_LOAD_RE.match(k)}
+        log.warning(
+            "forecast_load_kwh_<N>h fields present but not usable yet (likely still None while QSH calibrates/matures): %s",
+            diag,
+        )
 
     anchors = [(0.0, 0.0)] + sorted(loads.items())
     external_series = build_external_series(anchors) if len(anchors) > 1 else []

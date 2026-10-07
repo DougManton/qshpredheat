@@ -1,5 +1,5 @@
 name: "QSH Predheat Bridge"
-version: "0.1.1"
+version: "0.1.2"
 slug: "qshpredheat"
 description: "Bridges QSH (Quantum Storm Heating) forward heat-demand/solar forecasts into Home Assistant sensors, in the same shape Predbat's load_forecast expects from predheat"
 url: "https://github.com/DougManton/qshpredheat"
