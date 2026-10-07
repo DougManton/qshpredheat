@@ -19,8 +19,8 @@ accurate, provided QSH is already deployed and controlling your heat pump.
 
 | Option | Default | Description |
 |---|---|---|
-| `qsh_host` | `localhost` | Hostname/IP of the QSH add-on/container |
-| `qsh_port` | `8099` | Port QSH's API/WebSocket server listens on |
+| `qsh_host` | `localhost` | Hostname/IP of the QSH add-on/container. If QSH is installed as a Home Assistant add-on, this is **not** `localhost` — find the real value on QSH's own Settings → Add-ons → Quantum Swarm Heating → Info tab, under "Hostname" (looks like `<install-id>-quantum-swarm-heating`). Supervisor add-on containers share an internal network and are reachable from other add-ons by this hostname, independent of whether QSH's web UI uses Ingress. |
+| `qsh_port` | `9100` | Port QSH's API/WebSocket server listens on |
 | `qsh_scheme` | `ws` | `ws` or `wss` |
 | `entity_prefix` | `sensor.qsh` | Prefix for created entities |
 | `reconnect_delay` | `5` | Seconds to wait before reconnecting after a dropped connection |
