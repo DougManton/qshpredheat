@@ -25,7 +25,7 @@ import requests
 import websockets
 
 QSH_HOST = os.environ.get("QSH_HOST", "localhost")
-QSH_PORT = os.environ.get("QSH_PORT", "8099")
+QSH_PORT = os.environ.get("QSH_PORT", "9100")
 QSH_SCHEME = os.environ.get("QSH_SCHEME", "ws")
 ENTITY_PREFIX = os.environ.get("ENTITY_PREFIX", "sensor.qsh")
 RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "5"))

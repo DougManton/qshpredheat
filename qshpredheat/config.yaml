@@ -17,7 +17,7 @@ hassio_role: default
 homeassistant_api: true
 options:
   qsh_host: "localhost"
-  qsh_port: 8099
+  qsh_port: 9100
   qsh_scheme: "ws"
   entity_prefix: "sensor.qsh"
   reconnect_delay: 5
