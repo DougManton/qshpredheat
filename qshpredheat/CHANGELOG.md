@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3
+
+- Document QSH's per-room thermal-model maturity gating (`/api/sysid`,
+  `confidence` tiers) as the reason `forecast_load_kwh_<N>h` reads `null`
+  on a fresh install, and confirm Predbat's `load_forecast` already treats
+  an empty/missing `external` attribute as "skip this source," not zero
+  load — safe to wire in before QSH has matured.
+
 ## 0.1.2
 
 - `forecast_load_kwh_<N>h` keys are present in QSH's snapshot from the first

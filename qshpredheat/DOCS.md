@@ -47,6 +47,22 @@ QSH's public frontend source rather than a live instance, so if a sensor
 comes up empty, check `raw_snapshot` first and adjust `main.py`'s regex /
 field lookups to match.
 
+## QSH still calibrating
+
+On a fresh QSH install, `forecast_load_kwh_4h/12h/24h` will come through as
+`null` (this add-on then publishes an empty `external: []`) until QSH's
+per-room thermal model has enough passive observations. Check
+`http://<qsh_host>:<qsh_port>/api/sysid` for per-room `u_observations` /
+`c_observations` counts and a `confidence` tier (`low` under 10
+observations — using a prior only, `medium` 10-99, `high` 100+); the load
+forecast is expected to populate once rooms clear the `low` tier.
+
+This is safe to leave wired into Predbat while QSH calibrates: Predbat's
+`fetch_extra_load_forecast()` treats a missing/empty `external` attribute as
+"skip this source" (logs a `Warn` and drops it from the sum), not as zero
+load — it falls back to its other configured load-forecast sources in the
+meantime.
+
 ## Wiring into Predbat
 
 In `apps.yaml`, replace:
