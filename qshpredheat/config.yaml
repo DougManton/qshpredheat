@@ -1,0 +1,31 @@
+name: "QSH Predheat Bridge"
+version: "0.1.0"
+slug: "qshpredheat"
+description: "Bridges QSH (Quantum Storm Heating) forward heat-demand/solar forecasts into Home Assistant sensors, in the same shape Predbat's load_forecast expects from predheat"
+url: "https://github.com/DougManton/qshpredheat"
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+init: false
+startup: services
+boot: auto
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
+options:
+  qsh_host: "localhost"
+  qsh_port: 8099
+  qsh_scheme: "ws"
+  entity_prefix: "sensor.qsh"
+  reconnect_delay: 5
+  log_level: "info"
+schema:
+  qsh_host: "str"
+  qsh_port: "port"
+  qsh_scheme: "list(ws|wss)"
+  entity_prefix: "str"
+  reconnect_delay: "int(1,60)"
+  log_level: "list(debug|info|warning|error)"
