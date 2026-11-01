@@ -6,6 +6,20 @@ solar forecast as Home Assistant sensors, in the same attribute shape
 Predbat's `load_forecast` config expects from the `predheat` integration
 (a cumulative-kWh-since-now `external` list).
 
+This add-on deliberately talks to QSH over **only** that one unauthenticated
+WebSocket endpoint. QSH's own `IngressSecurityMiddleware` rejects any REST
+request (`/api/...`) from outside the HA Supervisor network or localhost with
+`403 Forbidden` once QSH's own ingress web UI has been opened even once —
+which almost every real install will have done — and this bridge, running in
+its own separate add-on container, sits outside that allow-list with no
+bypass available (QSH doesn't expose its `QSH_ALLOW_DIRECT_ACCESS` escape
+hatch as a configurable add-on option). Earlier versions of this add-on tried
+polling QSH's `/api/sysid` (for a forecast-confidence summary) and `/api/scop`
+(for a rolling COP) and hit this wall for both — those features were removed
+rather than shipped half-working. Anything this add-on needs beyond
+`/ws/live`'s own payload (COP, weather) is read from **Home Assistant's own
+API** instead, via `cop_entity` / `weather_entity` below — not from QSH.
+
 ## Why
 
 `predheat`'s thermal model has no solar-gain term — only a flat
@@ -25,8 +39,9 @@ accurate, provided QSH is already deployed and controlling your heat pump.
 | `entity_prefix` | `sensor.qsh` | Prefix for created entities |
 | `reconnect_delay` | `5` | Seconds to wait before reconnecting after a dropped connection |
 | `log_level` | `info` | `debug` / `info` / `warning` / `error` |
-| `heat_pump_cop` | `3.0` | Fallback coefficient of performance, used only when QSH has never yet reported a live COP (fresh install, heat pump always off/sensor-loss so far). Normally this add-on reads COP from QSH itself — see [Thermal vs electrical kWh](#thermal-vs-electrical-kwh) below. |
-| `sysid_poll_interval` | `300` | Seconds between polls of QSH's `/api/sysid` for the confidence summary — see [Forecast confidence](#forecast-confidence) below. Observation counts only grow over many control cycles, so this doesn't need to track the `/ws/live` forecast cadence. |
+| `heat_pump_cop` | `3.0` | Fallback coefficient of performance, used only when `cop_entity` is unset, unreadable, or has never reported a usable number. See [Thermal vs electrical kWh](#thermal-vs-electrical-kwh) below. |
+| `cop_entity` | `""` | A Home Assistant entity whose state is a **rolling-average** COP (e.g. a template sensor or utility-meter helper you maintain from your heat pump's own metered thermal/electrical energy, or whatever your heat pump's integration already exposes) — see [Thermal vs electrical kWh](#thermal-vs-electrical-kwh) below. Leave blank to always use `heat_pump_cop`. |
+| `cop_poll_interval` | `3600` | Seconds between reads of `cop_entity`. A rolling average moves slowly, so this doesn't need to be frequent. |
 | `weather_entity` | `""` | A Home Assistant weather entity (e.g. `weather.home`) used to shape the demand curve with real hour-by-hour temperature beyond QSH's own 6h forecast — see [Demand curve shaping](#demand-curve-shaping) below. Leave blank to disable (no cost; this option is a strict opt-in). |
 | `weather_poll_interval` | `1800` | Seconds between polls of `weather_entity`'s hourly forecast. Weather forecasts update far less often than `/ws/live`'s forecast cadence, so this doesn't need to be frequent. |
 
@@ -45,22 +60,14 @@ accurate, provided QSH is already deployed and controlling your heat pump.
   `forecast_load_kwh_thermal_net_of_solar` (after solar netting, still
   thermal), `solar_netted_kwh` and `solar_netting_partial_checkpoints` (see
   below), `heat_pump_cop` / `heat_pump_cop_source` (the divisor used and
-  where it came from: `live`, `last_known`, or `default`), and
-  `demand_curve_shaped_hours` / `weather_entity` (which hours of the curve
-  got real temperature shaping, and from where).
+  where it came from: `cop_entity`, `last_known`, or `default`), `cop_entity`
+  (which entity, if any), and `demand_curve_shaped_hours` / `weather_entity`
+  (which hours of the curve got real temperature shaping, and from where).
 - `<prefix>_forecast_load_kwh_<N>h` — one sensor per checkpoint QSH reports,
   in electrical kWh; each carries the corresponding `thermal_kwh_gross` /
   `thermal_kwh_net_of_solar` / `heat_pump_cop` / `heat_pump_cop_source`
   values as attributes.
 - `<prefix>_solar_kwh_12h` — QSH's 12h-ahead solar forecast, if present.
-- `<prefix>_forecast_confidence` — state is the worst per-room confidence
-  tier (`low`/`medium`/`high`/`unknown`) QSH's `/api/sysid` reports across
-  all rooms, polled every `sysid_poll_interval` seconds (see
-  [Forecast confidence](#forecast-confidence) below). Carries
-  `bottleneck_room`, `min_u_observations`, a full `rooms` breakdown, and the
-  raw `/api/sysid` response as attributes. `<prefix>_heat_energy` also
-  carries this same summary (`forecast_confidence` /
-  `forecast_confidence_detail`) so it travels with the forecast it describes.
 
 ## Thermal vs electrical kWh
 
@@ -88,16 +95,27 @@ battery/grid will need to supply), so before publishing, this add-on:
    sunny-enough window can't produce negative heating demand in this
    approximation). The un-netted gross values stay available as
    `forecast_load_kwh_thermal_gross` for comparison.
-2. **Converts thermal kWh to electrical kWh using QSH's own COP.** QSH
-   already tracks heat pump COP live — every `/ws/live` message carries a
-   top-level `hp.cop` field, which QSH itself sets to `null` (rather than
-   guessing) whenever the heat pump is off or in sensor-loss fallback. This
-   add-on reads that value each cycle and divides the net thermal load by
-   it. When `hp.cop` is `null`, it falls back to the last live value it
-   *has* seen (`heat_pump_cop_source: "last_known"`), and only falls back
-   to the static `heat_pump_cop` option (`"default"`) if QSH has never
-   reported a live COP at all. A flat, config-supplied COP is no longer the
-   normal path — it's purely the cold-start/always-off fallback.
+2. **Converts thermal kWh to electrical kWh using a rolling-average COP,
+   not a live/instantaneous one.** A live COP reading (QSH's `/ws/live`
+   feed does carry one, in `hp.cop`) reflects this instant's flow/outdoor
+   temperature — it says nothing about what COP will actually apply, on
+   average, over the next 24 forecast hours, and it's frequently `null`
+   anyway (QSH nulls it out whenever the heat pump is off, rather than
+   guessing). QSH computes a proper rolling figure itself
+   (`/api/scop?window=7d&mode=ch`), but that's a REST endpoint blocked by
+   QSH's `IngressSecurityMiddleware` for this add-on (see the note at the
+   top of this document) — so rather than build on data this add-on cannot
+   reliably reach, point `cop_entity` at a Home Assistant entity that
+   already tracks this for you instead (a template sensor computing
+   `Σ thermal / Σ electrical` over a trailing window from your heat pump's
+   own metered energy, a utility-meter helper, or whatever your heat pump's
+   own integration exposes). This add-on reads that entity's state every
+   `cop_poll_interval` seconds via HA's own API and divides the net thermal
+   load by it. If `cop_entity` is unset, unreadable, or its state isn't a
+   number (`unknown`/`unavailable`), it falls back to the last value it
+   *has* read (`heat_pump_cop_source: "last_known"`), and only falls back
+   to the static `heat_pump_cop` option (`"default"`) if no value has ever
+   been read.
 
 If you'd rather judge whether QSH's thermal forecast itself is trustworthy
 (independent of COP), QSH's author gives this check:
@@ -127,6 +145,11 @@ U_total (kW/K) = Load_4h ÷ Σ (T_target − OAT_h), for h = the next 4 hours
 This add-on does not compute `U_total` for you today — the raw inputs
 (`forecast_load_kwh_thermal_gross`, `hourly_temps_first_6`) are published so
 you can do it in a Home Assistant template sensor if you want to track it.
+Note this check itself needs QSH's `/api/sysid` (via its own web UI, or a
+browser/client that *is* on the allowed network) to read `u_observations` —
+that's a manual, occasional check you run yourself, not something this
+add-on automates, for the same reachability reason described at the top of
+this document.
 
 The `<prefix>_heat_energy` sensor also carries a `raw_snapshot` attribute
 with QSH's full `forecast_state_snapshot` payload, unmodified — use it in
@@ -136,30 +159,7 @@ Developer Tools to confirm the field names this add-on expects
 `oat_rise_next_6h_c`) still match your QSH version. These were taken from
 QSH's public frontend source rather than a live instance, so if a sensor
 comes up empty, check `raw_snapshot` first and adjust `main.py`'s regex /
-field lookups to match. `<prefix>_forecast_confidence` carries the equivalent
-`raw_sysid` attribute for `/api/sysid`'s response shape (`rooms.<room>.
-confidence` / `u_observations`), verified against QSH's own source rather
-than reverse-engineered, but still worth checking if it comes up `unknown`.
-
-## Forecast confidence
-
-A forecast can be numerically present (`forecast_load_kwh_<N>h` no longer
-`null`) while still resting on an immature sys-id — QSH's own per-room
-`confidence` badge (`low`/`medium`/`high`, from `/api/sysid`'s
-`u_observations` count) is the signal for that, not whether a number has
-appeared yet. This add-on polls `/api/sysid` every `sysid_poll_interval`
-seconds and reduces it to one overall tier: the **worst** confidence across
-all rooms, since `forecast_load_kwh_<N>h` sums fabric loss over every room,
-so one poorly-observed room can make the whole aggregate figure unreliable
-even if every other room is mature. That worst-case tier, the room
-responsible for it (`bottleneck_room`), and its observation count
-(`min_u_observations`) are attached to `<prefix>_forecast_confidence` and
-to every `<prefix>_heat_energy` publish (`forecast_confidence` /
-`forecast_confidence_detail`), so a load figure produced while confidence is
-`low` is visibly flagged as such rather than looking as trustworthy as one
-produced once rooms have matured. This is a count-of-evidence signal only —
-it says nothing about whether the *learned* U value is numerically close to
-reality, which is what the `U_total`/`U_design` cross-check above is for.
+field lookups to match.
 
 ## Demand curve shaping
 
@@ -185,10 +185,11 @@ temperature itself comes from two sources, by hour:
 - **Hours 6 onward**: the `weather_entity` option, if configured — polled
   every `weather_poll_interval` seconds via Home Assistant's
   `weather.get_forecasts` action (`type: hourly`), the same mechanism HA's
-  own automations use to read a weather integration's hourly forecast.
-  Point it at whatever weather entity you'd normally use for this (e.g.
-  `weather.home`); it must support an hourly forecast (not just daily) for
-  this to have any effect beyond hour 6.
+  own automations use to read a weather integration's hourly forecast. This
+  is HA's own API, not QSH's, so it isn't affected by the reachability note
+  at the top of this document. Point it at whatever weather entity you'd
+  normally use for this (e.g. `weather.home`); it must support an hourly
+  forecast (not just daily) for this to have any effect beyond hour 6.
 
 Any hour with no data from either source — `weather_entity` left blank, the
 weather call failing, or room target temperatures unavailable — falls back
@@ -200,41 +201,17 @@ which hours (0-indexed, from now) got real temperature shaping on a given
 cycle, so you can confirm it's working rather than guessing from the curve
 shape alone.
 
-### Forecast confidence blocked (403)
-
-QSH's own `IngressSecurityMiddleware` rejects any REST request from outside
-the Home Assistant Supervisor network or localhost with `403 Forbidden`,
-**once QSH's own ingress web UI has been opened even once** — which almost
-every real install will have done. This bridge runs in its own separate
-add-on container, so it sits outside that allow-list and will typically hit
-this 403 on `/api/sysid` in normal operation, not as a transient fault.
-There's no bypass available from this add-on's side — QSH doesn't expose the
-underlying `QSH_ALLOW_DIRECT_ACCESS` escape hatch as a configurable add-on
-option, so it can't be turned off from HA's Settings UI either.
-
-When this happens, `<prefix>_forecast_confidence` reports `unavailable`
-(distinct from `unknown`, which just means no poll has completed yet), the
-`forecast_confidence`/`forecast_confidence_detail` attributes on
-`<prefix>_heat_energy` follow suit, and the add-on logs **one** `WARNING`
-the first time it sees the 403 (not one per poll) — if you see it logging
-repeatedly, each occurrence should be `DEBUG`, not `WARNING`; a repeating
-`WARNING` would mean something changed (e.g. the host came back reachable
-with a *different* error). The underlying `/ws/live` feed and everything
-else this add-on does (solar netting, COP conversion, `load_forecast`) are
-unaffected — only the confidence summary is lost.
-
 ## QSH still calibrating
 
 On a fresh QSH install, `forecast_load_kwh_4h/12h/24h` will come through as
 `null` (this add-on then publishes an empty `external: []`) until QSH's
-per-room thermal model has enough passive observations. Check
-`http://<qsh_host>:<qsh_port>/api/sysid` for per-room `u_observations` /
-`c_observations` counts and a `confidence` tier (`low` under 10
-observations — using a prior only, `medium` 10-99, `high` 100+); the load
-forecast is expected to populate once rooms clear the `low` tier. Once it
-does, keep an eye on `<prefix>_forecast_confidence` for a while — clearing
-`low` is gradual per room, so the aggregate load figure can stay
-confidence-gated for some time after it first stops being `null`.
+per-room thermal model has enough passive observations. Check QSH's own
+`/api/sysid` (via its web UI, or a client on the Supervisor network/
+localhost — see the reachability note at the top of this document) for
+per-room `u_observations` / `c_observations` counts and a `confidence` tier
+(`low` under 10 observations — using a prior only, `medium` 10-99, `high`
+100+); the load forecast is expected to populate once rooms clear the `low`
+tier.
 
 This is safe to leave wired into Predbat while QSH calibrates: Predbat's
 `fetch_extra_load_forecast()` treats a missing/empty `external` attribute as

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.1.11
+
+- **Reverted 0.1.10's `/api/scop` polling.** It hit the same
+  `IngressSecurityMiddleware` 403 as `/api/sysid` always does for this
+  add-on (a separate container, outside QSH's allow-list) — shipping a
+  feature on data this add-on structurally cannot reach was the wrong call.
+  Replaced with a new `cop_entity` option: point it at a Home Assistant
+  entity whose state is a rolling-average COP (a template sensor you
+  maintain, a utility-meter helper, or whatever your heat pump's own
+  integration exposes), read via HA's own API — not QSH's — every
+  `cop_poll_interval` seconds (unchanged default, 3600s). Falls back to the
+  last value read (`heat_pump_cop_source: "last_known"`), then to the
+  static `heat_pump_cop` option (`"default"`) if `cop_entity` is unset,
+  unreadable, or has never reported a usable number. `heat_pump_cop_source`
+  values are now `cop_entity` / `last_known` / `default`.
+- **Removed the forecast-confidence feature entirely** (`/api/sysid`
+  polling, `<prefix>_forecast_confidence`, `forecast_confidence` /
+  `forecast_confidence_detail` attributes, `sysid_poll_interval` option).
+  It depended on the same REST access QSH's `IngressSecurityMiddleware`
+  blocks for this add-on, so it could never actually work in a normal
+  install. Judging forecast trustworthiness is still possible manually via
+  QSH's own `/api/sysid` or web UI (from a client on the allowed network) —
+  see "QSH still calibrating" and the `U_total`/`U_design` check in
+  DOCS.md — just not something this add-on can automate.
+- This add-on now makes **zero** REST calls to QSH — only the
+  unauthenticated `/ws/live` WebSocket. `cop_entity` and `weather_entity`
+  both read from Home Assistant's own API instead, which isn't subject to
+  QSH's restriction.
+
+## 0.1.10
+
+- Replaced live/instantaneous COP with QSH's 7-day rolling central-heating
+  SCOP for the thermal-to-electrical conversion: a live `hp.cop` reading
+  reflects this instant's flow/outdoor temp, not the average conditions a
+  24h-ahead forecast actually needs, and QSH nulls it out whenever the heat
+  pump is off anyway. Now polls `/api/scop?window=7d&mode=ch` (new
+  `cop_poll_interval` option, default 3600s; `mode=ch` excludes hot water,
+  whose COP can differ substantially from space heating's) and divides by
+  that instead, falling back to the last 7-day figure seen
+  (`heat_pump_cop_source: "last_known_scop"`), then to the static
+  `heat_pump_cop` option (`"default"`) only if no 7-day figure has ever come
+  through. `/api/scop` sits behind the same `IngressSecurityMiddleware` 403
+  as `/api/sysid`, handled the same way (one-time warning, graceful
+  fallback) — documented together as "Forecast confidence / 7-day SCOP
+  blocked (403)". `heat_pump_cop` is now a true last-resort fallback that
+  should rarely be the one in effect, rather than the `heat_pump_cop_source`
+  cycling in and out of it on every heat-pump off cycle as before.
+- `run.sh` now passes `bashio::config`'s fallback default (`'3.0'`)
+  explicitly for `heat_pump_cop` too, matching the other poll-interval
+  options, for consistency (changing an add-on option still requires
+  restarting the add-on — Supervisor doesn't re-run `run.sh` on save alone).
+
 ## 0.1.9
 
 - Added demand-curve shaping: the `external` series published for Predbat

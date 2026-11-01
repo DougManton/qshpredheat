@@ -12,41 +12,50 @@ electrical draw. Before publishing it for Predbat this script:
 
   1. Nets off QSH's own solar forecast (hourly_solar_first_6 /
      solar_kwh_12h) from the thermal load, floored at zero.
-  2. Divides by a COP to convert thermal kWh to electrical kWh, preferring
-     QSH's own live-measured COP (the top-level "hp.cop" field already
-     present on every /ws/live message) over the static `heat_pump_cop`
-     add-on option, which is used only as a last-known-good fallback for
-     cycles where QSH reports no live COP (heat pump off, or in
-     sensor-loss fallback) and no prior live value has been seen yet.
+  2. Divides by a COP to convert thermal kWh to electrical kWh. A live,
+     instantaneous COP is not representative of what will apply over a 24h
+     *forecast* (it depends on this instant's flow/outdoor temp, not
+     conditions over the forecast window), so a rolling-average COP is what
+     this wants. QSH itself computes one (`/api/scop`), but that's a REST
+     endpoint behind QSH's own IngressSecurityMiddleware, which blocks any
+     caller outside the HA Supervisor network/localhost once QSH's ingress
+     UI has been opened even once — this add-on, a separate container, is
+     outside that allow-list and cannot reach it. So rather than build a
+     feature on data this add-on structurally cannot fetch, this reads the
+     rolling COP from a `cop_entity` option instead: a Home Assistant
+     entity (e.g. a template/utility-meter sensor you maintain, or
+     whatever your heat pump's own integration already exposes) whose state
+     is a rolling-average COP. Polled on its own cadence (COP_POLL_INTERVAL)
+     via HA Core's own API — not QSH's — so it isn't subject to the same
+     restriction. The static `heat_pump_cop` option is the last-resort
+     fallback when `cop_entity` is unset, unreadable, or has never reported
+     a usable number.
 
 The original (gross, thermal, pre-solar) figures are kept available as
-attributes (forecast_load_kwh_thermal / thermal_kwh) for reference.
+attributes (forecast_load_kwh_thermal_gross / thermal_kwh_gross) for
+reference.
 
 The "external" cumulative series is also shaped within each QSH checkpoint
 window by hour-of-day temperature, instead of a flat rate across the whole
 window: QSH's own hourly_temps_first_6 covers hours 0-5, and the configured
-`weather_entity` option (polled via HA's weather.get_forecasts action)
-covers hours beyond that, so an overnight temperature dip inside a window
-gets correctly more of that window's energy rather than being averaged flat
-across it. Each window's own total always matches QSH's checkpoint exactly;
-only the shape within it changes. With no weather_entity configured, or
-missing room-target data, this degrades to the old flat behaviour exactly.
+`weather_entity` option (polled via HA's weather.get_forecasts action, also
+HA Core's own API) covers hours beyond that, so an overnight temperature dip
+inside a window gets correctly more of that window's energy rather than
+being averaged flat across it. Each window's own total always matches QSH's
+checkpoint exactly; only the shape within it changes. With no weather_entity
+configured, or missing room-target data, this degrades to the old flat
+behaviour exactly.
 
-Separately, this script polls QSH's /api/sysid on its own slower cadence
-(SYSID_POLL_INTERVAL) and attaches a confidence summary (the worst per-room
-confidence badge QSH itself reports, which rooms are the bottleneck, their
-observation counts) to every published forecast, so a figure produced while
-QSH's sys-id is still immature is visibly flagged rather than looking as
-trustworthy as a mature one.
-
-NOTE: QSH's own IngressSecurityMiddleware 403s any REST caller outside the
-HA Supervisor network/localhost once QSH's ingress UI has been opened even
-once — which, since this bridge runs in its own separate add-on container,
-is the expected outcome in most real installs, not a transient fault. There
-is no bypass available from this side (no QSH option exposes it); when this
-happens the confidence summary reports "unavailable" rather than retrying
-indefinitely as if it might succeed. See DOCS.md "Forecast confidence
-blocked (403)".
+NOTE: this add-on deliberately makes no REST calls to QSH at all (only the
+unauthenticated /ws/live WebSocket). QSH's IngressSecurityMiddleware blocks
+any REST caller outside the HA Supervisor network/localhost once its own
+ingress UI has been opened even once, which this add-on (a separate
+container) cannot avoid or bypass — there is no QSH-side option to disable
+it. An earlier version tried polling QSH's /api/sysid (for a forecast-
+confidence summary) and /api/scop (for rolling COP) and hit this wall for
+both; that approach was reverted rather than shipping a feature that cannot
+work in a normal install. `cop_entity` and `weather_entity` read from Home
+Assistant's own API instead, which is not affected by QSH's restriction.
 
 NOTE: the exact field names inside forecast_state_snapshot were reverse
 engineered from QSH's public frontend source (ForecastStatePanel.tsx) and
@@ -73,7 +82,8 @@ ENTITY_PREFIX = os.environ.get("ENTITY_PREFIX", "sensor.qsh")
 RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "5"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
 HEAT_PUMP_COP = float(os.environ.get("HEAT_PUMP_COP", "3.0"))
-SYSID_POLL_INTERVAL = int(os.environ.get("SYSID_POLL_INTERVAL", "300"))
+COP_ENTITY = os.environ.get("COP_ENTITY", "").strip()
+COP_POLL_INTERVAL = int(os.environ.get("COP_POLL_INTERVAL", "3600"))
 WEATHER_ENTITY = os.environ.get("WEATHER_ENTITY", "").strip()
 WEATHER_POLL_INTERVAL = int(os.environ.get("WEATHER_POLL_INTERVAL", "1800"))
 
@@ -81,149 +91,88 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN")
 HA_API_BASE = "http://supervisor/core/api"
 
 WS_URL = f"{QSH_SCHEME}://{QSH_HOST}:{QSH_PORT}/ws/live"
-HTTP_SCHEME = "https" if QSH_SCHEME == "wss" else "http"
-SYSID_URL = f"{HTTP_SCHEME}://{QSH_HOST}:{QSH_PORT}/api/sysid"
-
-# Confidence tiers QSH's own /api/sysid badge uses (INSTRUCTION-416), ranked
-# worst-to-best so the weakest room can gate the overall figure.
-CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
 FORECAST_LOAD_RE = re.compile(r"^forecast_load_kwh_(\d+)h$")
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("qshpredheat")
 
-# Last live COP QSH reported (payload["hp"]["cop"]), kept across cycles
-# where QSH reports none (heat pump off / sensor-loss fallback) so a brief
+# Most recent rolling COP read from the configured HA cop_entity (polled
+# separately — see poll_cop_loop), kept across polls that fail so a brief
 # gap doesn't fall all the way back to the static config default.
 _last_known_cop = None
-
-# Most recent confidence summary from QSH's /api/sysid (polled separately
-# from the /ws/live forecast cycle — see poll_sysid_loop), attached to every
-# published forecast so a stale/immature sys-id is visible alongside the
-# numbers it produced, not just discoverable by a separate query.
-_latest_confidence = None
-
-# Tracks the last fetch_sysid() error kind so poll_sysid_loop only logs a
-# WARNING when the failure mode changes, not on every poll forever — QSH's
-# IngressSecurityMiddleware 403s any REST caller outside the Supervisor
-# network/localhost once its own ingress UI has been opened even once, which
-# this add-on (a separate container) cannot avoid or retry past.
-_last_sysid_error = None
+_last_cop_error = None
 
 
-def fetch_sysid():
-    """Returns (payload, error) — exactly one is None. `error` is "forbidden"
-    for a 403 (QSH's IngressSecurityMiddleware; see module docstring),
-    "http_<status>" for another HTTP error, or "unreachable" for a
-    connection-level failure."""
+def fetch_cop_entity():
+    """Reads COP_ENTITY's current state via HA Core's own REST API (the
+    same one ha_set_state talks to) — never QSH's, so this isn't subject to
+    QSH's IngressSecurityMiddleware. Returns (value, error); exactly one is
+    None. `error` is "disabled" when cop_entity isn't configured,
+    "unusable_state" when the entity exists but its state isn't a number
+    (e.g. "unknown"/"unavailable"), "http_<status>" for an HTTP error, or
+    "unreachable" for a connection-level failure."""
+    if not COP_ENTITY:
+        return None, "disabled"
+    if not SUPERVISOR_TOKEN:
+        return None, "no_token"
+    url = f"{HA_API_BASE}/states/{COP_ENTITY}"
+    headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
     try:
-        resp = requests.get(SYSID_URL, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
-        return resp.json(), None
+        state = resp.json().get("state")
+        try:
+            return float(state), None
+        except (TypeError, ValueError):
+            return None, "unusable_state"
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else None
-        return None, "forbidden" if status == 403 else f"http_{status}"
+        return None, f"http_{status}"
     except requests.RequestException:
         return None, "unreachable"
 
 
-def summarise_confidence(sysid_payload):
-    """Reduce QSH's per-room /api/sysid confidence badges to one overall
-    tier (the worst room gates the whole aggregate forecast, since
-    forecast_load_kwh sums fabric loss across all rooms) plus the
-    bottleneck's observation count, alongside the full per-room breakdown."""
-    if not sysid_payload or not isinstance(sysid_payload.get("rooms"), dict) or not sysid_payload["rooms"]:
-        return None
-
-    per_room = {}
-    worst_rank = None
-    bottleneck_room = None
-    min_u_obs = None
-    for room, info in sysid_payload["rooms"].items():
-        if not isinstance(info, dict) or "confidence" not in info:
-            per_room[room] = {"confidence": "unknown", "u_observations": None}
-            continue
-        tier = info.get("confidence")
-        u_obs = info.get("u_observations")
-        per_room[room] = {"confidence": tier, "u_observations": u_obs}
-        rank = CONFIDENCE_RANK.get(tier)
-        if rank is not None and (worst_rank is None or rank < worst_rank):
-            worst_rank = rank
-            bottleneck_room = room
-        if isinstance(u_obs, (int, float)) and not isinstance(u_obs, bool):
-            if min_u_obs is None or u_obs < min_u_obs:
-                min_u_obs = u_obs
-
-    overall = next((tier for tier, rank in CONFIDENCE_RANK.items() if rank == worst_rank), "unknown")
-    return {
-        "overall": overall,
-        "bottleneck_room": bottleneck_room,
-        "min_u_observations": min_u_obs,
-        "rooms": per_room,
-    }
-
-
-async def poll_sysid_loop():
-    """Refreshes _latest_confidence from /api/sysid on its own cadence —
-    observation counts only climb over many control cycles, far slower than
-    /ws/live's forecast cadence, so there's no need to hit this endpoint
-    every forecast cycle."""
-    global _latest_confidence, _last_sysid_error
+async def poll_cop_loop():
+    """Refreshes _last_known_cop from cop_entity on its own cadence — a
+    rolling-average COP moves slowly, so there's no need to read it every
+    forecast cycle. A no-op (never polls) when cop_entity isn't configured,
+    so this is a strict opt-in with no cost otherwise."""
+    global _last_known_cop, _last_cop_error
+    if not COP_ENTITY:
+        log.info(
+            "cop_entity not configured: COP conversion will use the static "
+            "heat_pump_cop default (%.2f).", HEAT_PUMP_COP,
+        )
+        return
     while True:
-        sysid_payload, error = await asyncio.to_thread(fetch_sysid)
-
+        value, error = await asyncio.to_thread(fetch_cop_entity)
         if error is not None:
-            if error != _last_sysid_error:
-                if error == "forbidden":
-                    log.warning(
-                        "QSH's /api/sysid returned 403 Forbidden. QSH's own IngressSecurityMiddleware "
-                        "blocks REST callers outside the Supervisor network/localhost once its ingress "
-                        "UI has been opened even once, and this add-on (a separate container) cannot "
-                        "bypass that — it is not something this add-on can retry past. Forecast "
-                        "confidence will report 'unavailable' until QSH changes this. See DOCS.md "
-                        "'Forecast confidence blocked (403)'."
-                    )
-                else:
-                    log.warning("Failed to fetch %s: %s. Forecast confidence will report 'unavailable'.", SYSID_URL, error)
-                _last_sysid_error = error
+            if error != _last_cop_error:
+                log.warning(
+                    "Failed to read COP from %s: %s. Falling back to the last known "
+                    "value, or heat_pump_cop if none has ever been seen.",
+                    COP_ENTITY, error,
+                )
+                _last_cop_error = error
             else:
-                log.debug("QSH's /api/sysid still failing (%s)", error)
-            _latest_confidence = {
-                "overall": "unavailable",
-                "bottleneck_room": None,
-                "min_u_observations": None,
-                "rooms": {},
-                "error": error,
-            }
-            ha_set_state(
-                f"{ENTITY_PREFIX}_forecast_confidence",
-                state="unavailable",
-                attributes={"friendly_name": "QSH Forecast Confidence", "error": error},
-            )
-            await asyncio.sleep(SYSID_POLL_INTERVAL)
-            continue
+                log.debug("%s still unreadable (%s)", COP_ENTITY, error)
+        else:
+            _last_cop_error = None
+            _last_known_cop = value
+            log.debug("Rolling COP from %s: %.3f", COP_ENTITY, value)
+        await asyncio.sleep(COP_POLL_INTERVAL)
 
-        _last_sysid_error = None
-        summary = summarise_confidence(sysid_payload)
-        if summary is not None:
-            _latest_confidence = summary
-            log.info(
-                "QSH sys-id confidence: overall=%s bottleneck_room=%s min_u_observations=%s",
-                summary["overall"], summary["bottleneck_room"], summary["min_u_observations"],
-            )
-            ha_set_state(
-                f"{ENTITY_PREFIX}_forecast_confidence",
-                state=summary["overall"],
-                attributes={
-                    "friendly_name": "QSH Forecast Confidence",
-                    "bottleneck_room": summary["bottleneck_room"],
-                    "min_u_observations": summary["min_u_observations"],
-                    "rooms": summary["rooms"],
-                    "raw_sysid": sysid_payload,
-                },
-            )
-        await asyncio.sleep(SYSID_POLL_INTERVAL)
+
+def resolve_cop():
+    """Return (cop, source) where source is "cop_entity", "last_known", or
+    "default". Never reads a live/instantaneous COP from QSH — see module
+    docstring for why that's unsuitable for a forecast, and why this reads
+    from a configurable HA entity rather than QSH's own (blocked) /api/scop."""
+    if _last_known_cop is not None:
+        source = "cop_entity" if _last_cop_error is None else "last_known"
+        return _last_known_cop, source
+    return HEAT_PUMP_COP, "default"
 
 
 # Most recent hourly forecast from the configured HA weather_entity, as a
@@ -353,22 +302,6 @@ def compute_hourly_weights(snapshot, payload, max_hour):
             weights[hour] = max(0.0, t_target_mean - temp)
 
     return weights
-
-
-def resolve_cop(payload):
-    """Return (cop, source) where source is "live", "last_known", or
-    "default". QSH's own "hp.cop" is null-preserving (null when the heat
-    pump is off or in sensor-loss fallback), never a guessed baseline, so
-    that's the trustworthy signal to prefer over our own static default."""
-    global _last_known_cop
-    hp = payload.get("hp")
-    live_cop = hp.get("cop") if isinstance(hp, dict) else None
-    if isinstance(live_cop, (int, float)) and not isinstance(live_cop, bool):
-        _last_known_cop = float(live_cop)
-        return _last_known_cop, "live"
-    if _last_known_cop is not None:
-        return _last_known_cop, "last_known"
-    return HEAT_PUMP_COP, "default"
 
 
 def net_solar(loads_thermal, snapshot):
@@ -513,10 +446,10 @@ def handle_snapshot(payload):
 
     # QSH's forecast_load_kwh_<N>h is gross fabric heat loss (thermal kWh):
     # net off QSH's own solar forecast, then convert to electrical kWh using
-    # QSH's live-measured COP (falling back to the configured default) —
-    # Predbat's load_forecast expects electrical kWh.
+    # a rolling COP from cop_entity (falling back to the configured default)
+    # — Predbat's load_forecast expects electrical kWh.
     loads_net_thermal, solar_netted, partial_solar_checkpoints = net_solar(loads_thermal, snapshot)
-    cop, cop_source = resolve_cop(payload)
+    cop, cop_source = resolve_cop()
     loads = {hours: kwh / cop for hours, kwh in loads_net_thermal.items()}
 
     anchors = [(0.0, 0.0)] + sorted(loads.items())
@@ -541,14 +474,13 @@ def handle_snapshot(payload):
             "solar_netting_partial_checkpoints": partial_solar_checkpoints,
             "heat_pump_cop": cop,
             "heat_pump_cop_source": cop_source,
+            "cop_entity": COP_ENTITY or None,
             "solar_kwh_12h": solar_12h,
             "cold_snap_active": snapshot.get("cold_snap_active"),
             "wind_active": snapshot.get("wind_active"),
             "oat_rise_next_6h_c": snapshot.get("oat_rise_next_6h_c"),
             "hourly_temps_first_6": snapshot.get("hourly_temps_first_6"),
             "hourly_solar_first_6": snapshot.get("hourly_solar_first_6"),
-            "forecast_confidence": _latest_confidence.get("overall") if _latest_confidence else "unknown",
-            "forecast_confidence_detail": _latest_confidence,
             "demand_curve_shaped_hours": sorted(hourly_weights.keys()),
             "weather_entity": WEATHER_ENTITY or None,
             "raw_snapshot": snapshot,
@@ -579,9 +511,8 @@ def handle_snapshot(payload):
 
     log.info(
         "Published QSH forecast: loads_electrical=%s loads_thermal_net=%s loads_thermal_gross=%s "
-        "cop=%s (%s) solar_netted=%s solar_12h=%s confidence=%s",
+        "cop=%s (%s) solar_netted=%s solar_12h=%s",
         loads, loads_net_thermal, loads_thermal, cop, cop_source, solar_netted, solar_12h,
-        _latest_confidence.get("overall") if _latest_confidence else "unknown",
     )
 
 
@@ -606,7 +537,7 @@ async def run_ws():
 
 
 async def run():
-    await asyncio.gather(run_ws(), poll_sysid_loop(), poll_weather_loop())
+    await asyncio.gather(run_ws(), poll_weather_loop(), poll_cop_loop())
 
 
 if __name__ == "__main__":
