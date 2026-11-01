@@ -155,6 +155,29 @@ produced once rooms have matured. This is a count-of-evidence signal only —
 it says nothing about whether the *learned* U value is numerically close to
 reality, which is what the `U_total`/`U_design` cross-check above is for.
 
+### Forecast confidence blocked (403)
+
+QSH's own `IngressSecurityMiddleware` rejects any REST request from outside
+the Home Assistant Supervisor network or localhost with `403 Forbidden`,
+**once QSH's own ingress web UI has been opened even once** — which almost
+every real install will have done. This bridge runs in its own separate
+add-on container, so it sits outside that allow-list and will typically hit
+this 403 on `/api/sysid` in normal operation, not as a transient fault.
+There's no bypass available from this add-on's side — QSH doesn't expose the
+underlying `QSH_ALLOW_DIRECT_ACCESS` escape hatch as a configurable add-on
+option, so it can't be turned off from HA's Settings UI either.
+
+When this happens, `<prefix>_forecast_confidence` reports `unavailable`
+(distinct from `unknown`, which just means no poll has completed yet), the
+`forecast_confidence`/`forecast_confidence_detail` attributes on
+`<prefix>_heat_energy` follow suit, and the add-on logs **one** `WARNING`
+the first time it sees the 403 (not one per poll) — if you see it logging
+repeatedly, each occurrence should be `DEBUG`, not `WARNING`; a repeating
+`WARNING` would mean something changed (e.g. the host came back reachable
+with a *different* error). The underlying `/ws/live` feed and everything
+else this add-on does (solar netting, COP conversion, `load_forecast`) are
+unaffected — only the confidence summary is lost.
+
 ## QSH still calibrating
 
 On a fresh QSH install, `forecast_load_kwh_4h/12h/24h` will come through as

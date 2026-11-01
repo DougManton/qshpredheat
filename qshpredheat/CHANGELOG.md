@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.8
+
+- Fixed `Failed to save: Missing option 'sysid_poll_interval' in root` when
+  editing config in the HA UI on an install whose stored options predate
+  0.1.6 (Supervisor doesn't always backfill a newly-added option into an
+  existing install before the next save). `sysid_poll_interval`'s schema is
+  now optional (`int(30,3600)?`) with `run.sh` supplying the `300` default
+  via `bashio::config`'s fallback argument when the key is absent, instead
+  of relying on it always being present.
+
+## 0.1.7
+
+- Fixed log spam and a stuck "unknown" state when QSH's `/api/sysid` is
+  unreachable: QSH's own `IngressSecurityMiddleware` returns `403 Forbidden`
+  to any REST caller outside the HA Supervisor network/localhost once QSH's
+  ingress UI has been opened even once — expected behaviour for this bridge
+  (a separate add-on container) in most real installs, not a transient
+  fault, and not something this add-on can bypass (QSH exposes no
+  configurable escape hatch). `poll_sysid_loop` now logs one `WARNING` per
+  distinct failure kind instead of one every `sysid_poll_interval` forever,
+  and `<prefix>_forecast_confidence` reports an explicit `unavailable`
+  state (vs. `unknown` for "no poll has completed yet") so this is visible
+  rather than silently stuck. Documented as "Forecast confidence blocked
+  (403)" in DOCS.md.
+
 ## 0.1.6
 
 - Added a confidence score alongside the forecast data: polls QSH's

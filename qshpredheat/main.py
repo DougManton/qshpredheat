@@ -29,6 +29,15 @@ observation counts) to every published forecast, so a figure produced while
 QSH's sys-id is still immature is visibly flagged rather than looking as
 trustworthy as a mature one.
 
+NOTE: QSH's own IngressSecurityMiddleware 403s any REST caller outside the
+HA Supervisor network/localhost once QSH's ingress UI has been opened even
+once — which, since this bridge runs in its own separate add-on container,
+is the expected outcome in most real installs, not a transient fault. There
+is no bypass available from this side (no QSH option exposes it); when this
+happens the confidence summary reports "unavailable" rather than retrying
+indefinitely as if it might succeed. See DOCS.md "Forecast confidence
+blocked (403)".
+
 NOTE: the exact field names inside forecast_state_snapshot were reverse
 engineered from QSH's public frontend source (ForecastStatePanel.tsx) and
 have not been verified against a live instance. This script is written
@@ -83,15 +92,28 @@ _last_known_cop = None
 # numbers it produced, not just discoverable by a separate query.
 _latest_confidence = None
 
+# Tracks the last fetch_sysid() error kind so poll_sysid_loop only logs a
+# WARNING when the failure mode changes, not on every poll forever — QSH's
+# IngressSecurityMiddleware 403s any REST caller outside the Supervisor
+# network/localhost once its own ingress UI has been opened even once, which
+# this add-on (a separate container) cannot avoid or retry past.
+_last_sysid_error = None
+
 
 def fetch_sysid():
+    """Returns (payload, error) — exactly one is None. `error` is "forbidden"
+    for a 403 (QSH's IngressSecurityMiddleware; see module docstring),
+    "http_<status>" for another HTTP error, or "unreachable" for a
+    connection-level failure."""
     try:
         resp = requests.get(SYSID_URL, timeout=10)
         resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as exc:
-        log.warning("Failed to fetch %s: %s", SYSID_URL, exc)
-        return None
+        return resp.json(), None
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        return None, "forbidden" if status == 403 else f"http_{status}"
+    except requests.RequestException:
+        return None, "unreachable"
 
 
 def summarise_confidence(sysid_payload):
@@ -135,9 +157,42 @@ async def poll_sysid_loop():
     observation counts only climb over many control cycles, far slower than
     /ws/live's forecast cadence, so there's no need to hit this endpoint
     every forecast cycle."""
-    global _latest_confidence
+    global _latest_confidence, _last_sysid_error
     while True:
-        sysid_payload = await asyncio.to_thread(fetch_sysid)
+        sysid_payload, error = await asyncio.to_thread(fetch_sysid)
+
+        if error is not None:
+            if error != _last_sysid_error:
+                if error == "forbidden":
+                    log.warning(
+                        "QSH's /api/sysid returned 403 Forbidden. QSH's own IngressSecurityMiddleware "
+                        "blocks REST callers outside the Supervisor network/localhost once its ingress "
+                        "UI has been opened even once, and this add-on (a separate container) cannot "
+                        "bypass that — it is not something this add-on can retry past. Forecast "
+                        "confidence will report 'unavailable' until QSH changes this. See DOCS.md "
+                        "'Forecast confidence blocked (403)'."
+                    )
+                else:
+                    log.warning("Failed to fetch %s: %s. Forecast confidence will report 'unavailable'.", SYSID_URL, error)
+                _last_sysid_error = error
+            else:
+                log.debug("QSH's /api/sysid still failing (%s)", error)
+            _latest_confidence = {
+                "overall": "unavailable",
+                "bottleneck_room": None,
+                "min_u_observations": None,
+                "rooms": {},
+                "error": error,
+            }
+            ha_set_state(
+                f"{ENTITY_PREFIX}_forecast_confidence",
+                state="unavailable",
+                attributes={"friendly_name": "QSH Forecast Confidence", "error": error},
+            )
+            await asyncio.sleep(SYSID_POLL_INTERVAL)
+            continue
+
+        _last_sysid_error = None
         summary = summarise_confidence(sysid_payload)
         if summary is not None:
             _latest_confidence = summary
