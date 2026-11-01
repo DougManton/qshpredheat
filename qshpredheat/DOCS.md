@@ -26,6 +26,7 @@ accurate, provided QSH is already deployed and controlling your heat pump.
 | `reconnect_delay` | `5` | Seconds to wait before reconnecting after a dropped connection |
 | `log_level` | `info` | `debug` / `info` / `warning` / `error` |
 | `heat_pump_cop` | `3.0` | Fallback coefficient of performance, used only when QSH has never yet reported a live COP (fresh install, heat pump always off/sensor-loss so far). Normally this add-on reads COP from QSH itself — see [Thermal vs electrical kWh](#thermal-vs-electrical-kwh) below. |
+| `sysid_poll_interval` | `300` | Seconds between polls of QSH's `/api/sysid` for the confidence summary — see [Forecast confidence](#forecast-confidence) below. Observation counts only grow over many control cycles, so this doesn't need to track the `/ws/live` forecast cadence. |
 
 ## Entities created
 
@@ -46,6 +47,14 @@ accurate, provided QSH is already deployed and controlling your heat pump.
   `thermal_kwh_net_of_solar` / `heat_pump_cop` / `heat_pump_cop_source`
   values as attributes.
 - `<prefix>_solar_kwh_12h` — QSH's 12h-ahead solar forecast, if present.
+- `<prefix>_forecast_confidence` — state is the worst per-room confidence
+  tier (`low`/`medium`/`high`/`unknown`) QSH's `/api/sysid` reports across
+  all rooms, polled every `sysid_poll_interval` seconds (see
+  [Forecast confidence](#forecast-confidence) below). Carries
+  `bottleneck_room`, `min_u_observations`, a full `rooms` breakdown, and the
+  raw `/api/sysid` response as attributes. `<prefix>_heat_energy` also
+  carries this same summary (`forecast_confidence` /
+  `forecast_confidence_detail`) so it travels with the forecast it describes.
 
 ## Thermal vs electrical kWh
 
@@ -121,7 +130,30 @@ Developer Tools to confirm the field names this add-on expects
 `oat_rise_next_6h_c`) still match your QSH version. These were taken from
 QSH's public frontend source rather than a live instance, so if a sensor
 comes up empty, check `raw_snapshot` first and adjust `main.py`'s regex /
-field lookups to match.
+field lookups to match. `<prefix>_forecast_confidence` carries the equivalent
+`raw_sysid` attribute for `/api/sysid`'s response shape (`rooms.<room>.
+confidence` / `u_observations`), verified against QSH's own source rather
+than reverse-engineered, but still worth checking if it comes up `unknown`.
+
+## Forecast confidence
+
+A forecast can be numerically present (`forecast_load_kwh_<N>h` no longer
+`null`) while still resting on an immature sys-id — QSH's own per-room
+`confidence` badge (`low`/`medium`/`high`, from `/api/sysid`'s
+`u_observations` count) is the signal for that, not whether a number has
+appeared yet. This add-on polls `/api/sysid` every `sysid_poll_interval`
+seconds and reduces it to one overall tier: the **worst** confidence across
+all rooms, since `forecast_load_kwh_<N>h` sums fabric loss over every room,
+so one poorly-observed room can make the whole aggregate figure unreliable
+even if every other room is mature. That worst-case tier, the room
+responsible for it (`bottleneck_room`), and its observation count
+(`min_u_observations`) are attached to `<prefix>_forecast_confidence` and
+to every `<prefix>_heat_energy` publish (`forecast_confidence` /
+`forecast_confidence_detail`), so a load figure produced while confidence is
+`low` is visibly flagged as such rather than looking as trustworthy as one
+produced once rooms have matured. This is a count-of-evidence signal only —
+it says nothing about whether the *learned* U value is numerically close to
+reality, which is what the `U_total`/`U_design` cross-check above is for.
 
 ## QSH still calibrating
 
@@ -131,7 +163,10 @@ per-room thermal model has enough passive observations. Check
 `http://<qsh_host>:<qsh_port>/api/sysid` for per-room `u_observations` /
 `c_observations` counts and a `confidence` tier (`low` under 10
 observations — using a prior only, `medium` 10-99, `high` 100+); the load
-forecast is expected to populate once rooms clear the `low` tier.
+forecast is expected to populate once rooms clear the `low` tier. Once it
+does, keep an eye on `<prefix>_forecast_confidence` for a while — clearing
+`low` is gradual per room, so the aggregate load figure can stay
+confidence-gated for some time after it first stops being `null`.
 
 This is safe to leave wired into Predbat while QSH calibrates: Predbat's
 `fetch_extra_load_forecast()` treats a missing/empty `external` attribute as

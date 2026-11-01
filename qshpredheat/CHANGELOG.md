@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.6
+
+- Added a confidence score alongside the forecast data: polls QSH's
+  `/api/sysid` (verified against QSH's own source — `rooms.<room>.
+  confidence` is a `low`/`medium`/`high` badge keyed on that room's
+  `u_observations` count) on its own `sysid_poll_interval` cadence
+  (default 300s, independent of the `/ws/live` forecast cycle). Reduces it
+  to the worst confidence tier across all rooms (the bottleneck gates the
+  whole aggregate load figure) and publishes it as a new
+  `<prefix>_forecast_confidence` sensor (state = overall tier; attributes =
+  `bottleneck_room`, `min_u_observations`, per-room breakdown, raw
+  `/api/sysid` response) plus `forecast_confidence` /
+  `forecast_confidence_detail` attributes on every `<prefix>_heat_energy`
+  publish and in the per-cycle log line, so a load figure produced while
+  sys-id is still immature is visibly flagged rather than looking as
+  trustworthy as a mature one.
+
 ## 0.1.5
 
 - Solar gain was never actually netted against QSH's thermal load anywhere

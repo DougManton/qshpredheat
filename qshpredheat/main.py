@@ -22,6 +22,13 @@ electrical draw. Before publishing it for Predbat this script:
 The original (gross, thermal, pre-solar) figures are kept available as
 attributes (forecast_load_kwh_thermal / thermal_kwh) for reference.
 
+Separately, this script polls QSH's /api/sysid on its own slower cadence
+(SYSID_POLL_INTERVAL) and attaches a confidence summary (the worst per-room
+confidence badge QSH itself reports, which rooms are the bottleneck, their
+observation counts) to every published forecast, so a figure produced while
+QSH's sys-id is still immature is visibly flagged rather than looking as
+trustworthy as a mature one.
+
 NOTE: the exact field names inside forecast_state_snapshot were reverse
 engineered from QSH's public frontend source (ForecastStatePanel.tsx) and
 have not been verified against a live instance. This script is written
@@ -47,11 +54,18 @@ ENTITY_PREFIX = os.environ.get("ENTITY_PREFIX", "sensor.qsh")
 RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "5"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
 HEAT_PUMP_COP = float(os.environ.get("HEAT_PUMP_COP", "3.0"))
+SYSID_POLL_INTERVAL = int(os.environ.get("SYSID_POLL_INTERVAL", "300"))
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN")
 HA_API_BASE = "http://supervisor/core/api"
 
 WS_URL = f"{QSH_SCHEME}://{QSH_HOST}:{QSH_PORT}/ws/live"
+HTTP_SCHEME = "https" if QSH_SCHEME == "wss" else "http"
+SYSID_URL = f"{HTTP_SCHEME}://{QSH_HOST}:{QSH_PORT}/api/sysid"
+
+# Confidence tiers QSH's own /api/sysid badge uses (INSTRUCTION-416), ranked
+# worst-to-best so the weakest room can gate the overall figure.
+CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
 FORECAST_LOAD_RE = re.compile(r"^forecast_load_kwh_(\d+)h$")
 
@@ -62,6 +76,87 @@ log = logging.getLogger("qshpredheat")
 # where QSH reports none (heat pump off / sensor-loss fallback) so a brief
 # gap doesn't fall all the way back to the static config default.
 _last_known_cop = None
+
+# Most recent confidence summary from QSH's /api/sysid (polled separately
+# from the /ws/live forecast cycle — see poll_sysid_loop), attached to every
+# published forecast so a stale/immature sys-id is visible alongside the
+# numbers it produced, not just discoverable by a separate query.
+_latest_confidence = None
+
+
+def fetch_sysid():
+    try:
+        resp = requests.get(SYSID_URL, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        log.warning("Failed to fetch %s: %s", SYSID_URL, exc)
+        return None
+
+
+def summarise_confidence(sysid_payload):
+    """Reduce QSH's per-room /api/sysid confidence badges to one overall
+    tier (the worst room gates the whole aggregate forecast, since
+    forecast_load_kwh sums fabric loss across all rooms) plus the
+    bottleneck's observation count, alongside the full per-room breakdown."""
+    if not sysid_payload or not isinstance(sysid_payload.get("rooms"), dict) or not sysid_payload["rooms"]:
+        return None
+
+    per_room = {}
+    worst_rank = None
+    bottleneck_room = None
+    min_u_obs = None
+    for room, info in sysid_payload["rooms"].items():
+        if not isinstance(info, dict) or "confidence" not in info:
+            per_room[room] = {"confidence": "unknown", "u_observations": None}
+            continue
+        tier = info.get("confidence")
+        u_obs = info.get("u_observations")
+        per_room[room] = {"confidence": tier, "u_observations": u_obs}
+        rank = CONFIDENCE_RANK.get(tier)
+        if rank is not None and (worst_rank is None or rank < worst_rank):
+            worst_rank = rank
+            bottleneck_room = room
+        if isinstance(u_obs, (int, float)) and not isinstance(u_obs, bool):
+            if min_u_obs is None or u_obs < min_u_obs:
+                min_u_obs = u_obs
+
+    overall = next((tier for tier, rank in CONFIDENCE_RANK.items() if rank == worst_rank), "unknown")
+    return {
+        "overall": overall,
+        "bottleneck_room": bottleneck_room,
+        "min_u_observations": min_u_obs,
+        "rooms": per_room,
+    }
+
+
+async def poll_sysid_loop():
+    """Refreshes _latest_confidence from /api/sysid on its own cadence —
+    observation counts only climb over many control cycles, far slower than
+    /ws/live's forecast cadence, so there's no need to hit this endpoint
+    every forecast cycle."""
+    global _latest_confidence
+    while True:
+        sysid_payload = await asyncio.to_thread(fetch_sysid)
+        summary = summarise_confidence(sysid_payload)
+        if summary is not None:
+            _latest_confidence = summary
+            log.info(
+                "QSH sys-id confidence: overall=%s bottleneck_room=%s min_u_observations=%s",
+                summary["overall"], summary["bottleneck_room"], summary["min_u_observations"],
+            )
+            ha_set_state(
+                f"{ENTITY_PREFIX}_forecast_confidence",
+                state=summary["overall"],
+                attributes={
+                    "friendly_name": "QSH Forecast Confidence",
+                    "bottleneck_room": summary["bottleneck_room"],
+                    "min_u_observations": summary["min_u_observations"],
+                    "rooms": summary["rooms"],
+                    "raw_sysid": sysid_payload,
+                },
+            )
+        await asyncio.sleep(SYSID_POLL_INTERVAL)
 
 
 def resolve_cop(payload):
@@ -222,6 +317,8 @@ def handle_snapshot(payload):
             "oat_rise_next_6h_c": snapshot.get("oat_rise_next_6h_c"),
             "hourly_temps_first_6": snapshot.get("hourly_temps_first_6"),
             "hourly_solar_first_6": snapshot.get("hourly_solar_first_6"),
+            "forecast_confidence": _latest_confidence.get("overall") if _latest_confidence else "unknown",
+            "forecast_confidence_detail": _latest_confidence,
             "raw_snapshot": snapshot,
         },
     )
@@ -250,12 +347,13 @@ def handle_snapshot(payload):
 
     log.info(
         "Published QSH forecast: loads_electrical=%s loads_thermal_net=%s loads_thermal_gross=%s "
-        "cop=%s (%s) solar_netted=%s solar_12h=%s",
+        "cop=%s (%s) solar_netted=%s solar_12h=%s confidence=%s",
         loads, loads_net_thermal, loads_thermal, cop, cop_source, solar_netted, solar_12h,
+        _latest_confidence.get("overall") if _latest_confidence else "unknown",
     )
 
 
-async def run():
+async def run_ws():
     log.info("Connecting to %s", WS_URL)
     while True:
         try:
@@ -273,6 +371,10 @@ async def run():
         except Exception:
             log.exception("Unexpected error; reconnecting in %ss", RECONNECT_DELAY)
         await asyncio.sleep(RECONNECT_DELAY)
+
+
+async def run():
+    await asyncio.gather(run_ws(), poll_sysid_loop())
 
 
 if __name__ == "__main__":
