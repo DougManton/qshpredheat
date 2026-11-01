@@ -25,17 +25,93 @@ accurate, provided QSH is already deployed and controlling your heat pump.
 | `entity_prefix` | `sensor.qsh` | Prefix for created entities |
 | `reconnect_delay` | `5` | Seconds to wait before reconnecting after a dropped connection |
 | `log_level` | `info` | `debug` / `info` / `warning` / `error` |
+| `heat_pump_cop` | `3.0` | Fallback coefficient of performance, used only when QSH has never yet reported a live COP (fresh install, heat pump always off/sensor-loss so far). Normally this add-on reads COP from QSH itself — see [Thermal vs electrical kWh](#thermal-vs-electrical-kwh) below. |
 
 ## Entities created
 
-- `<prefix>_heat_energy` — state is the furthest-out forecast total (kWh);
-  carries an `external` attribute (list of `{last_updated, energy}` points,
-  cumulative kWh from now) built by linearly interpolating between whatever
+- `<prefix>_heat_energy` — state is the furthest-out forecast total, in
+  **electrical** kWh (solar-netted thermal kWh ÷ COP); carries an `external`
+  attribute (list of `{last_updated, energy}` points, cumulative electrical
+  kWh from now) built by linearly interpolating between whatever
   `forecast_load_kwh_<N>h` checkpoints QSH reports (commonly 4h/12h/24h).
   Point this at Predbat's `load_forecast:` config in place of
-  `predheat.heat_energy$external`.
-- `<prefix>_forecast_load_kwh_<N>h` — one sensor per checkpoint QSH reports.
+  `predheat.heat_energy$external`. Also carries, as attributes:
+  `forecast_load_kwh_thermal_gross` (QSH's raw, unconverted thermal values),
+  `forecast_load_kwh_thermal_net_of_solar` (after solar netting, still
+  thermal), `solar_netted_kwh` and `solar_netting_partial_checkpoints` (see
+  below), and `heat_pump_cop` / `heat_pump_cop_source` (the divisor used and
+  where it came from: `live`, `last_known`, or `default`).
+- `<prefix>_forecast_load_kwh_<N>h` — one sensor per checkpoint QSH reports,
+  in electrical kWh; each carries the corresponding `thermal_kwh_gross` /
+  `thermal_kwh_net_of_solar` / `heat_pump_cop` / `heat_pump_cop_source`
+  values as attributes.
 - `<prefix>_solar_kwh_12h` — QSH's 12h-ahead solar forecast, if present.
+
+## Thermal vs electrical kWh
+
+QSH's `forecast_load_kwh_<N>h` is **gross fabric heat loss**, in thermal
+kWh: how much heat the building is calculated to lose over the next N
+hours, before solar gain is netted off, and before converting to how much
+electricity the heat pump will draw to replace it. Predbat's
+`load_forecast` expects electrical kWh (it's forecasting what the
+battery/grid will need to supply), so before publishing, this add-on:
+
+1. **Nets off solar gain.** QSH reports fabric heat loss and solar gain as
+   two separate figures (`forecast_load_kwh_<N>h` and
+   `solar_kwh_12h`/`hourly_solar_first_6`) rather than a solar-adjusted
+   load — so unless something nets them against each other, solar isn't
+   actually accounted for anywhere, despite it being the whole reason to
+   prefer QSH's forecast over `predheat`'s no-solar-gain model (see "Why"
+   above). This add-on now does that netting itself: for the 4h checkpoint
+   it subtracts the first 4 values of `hourly_solar_first_6`; for 12h it
+   subtracts `solar_kwh_12h` directly; for any checkpoint beyond 12h (e.g.
+   24h) it can only subtract the 12h solar total, since QSH's `/ws/live`
+   feed carries no solar forecast beyond 12h — the result for a >12h
+   checkpoint therefore under-nets the true solar offset for the hours past
+   12h. Checkpoints netted this way are listed in
+   `solar_netting_partial_checkpoints`. Each net figure is floored at 0 (a
+   sunny-enough window can't produce negative heating demand in this
+   approximation). The un-netted gross values stay available as
+   `forecast_load_kwh_thermal_gross` for comparison.
+2. **Converts thermal kWh to electrical kWh using QSH's own COP.** QSH
+   already tracks heat pump COP live — every `/ws/live` message carries a
+   top-level `hp.cop` field, which QSH itself sets to `null` (rather than
+   guessing) whenever the heat pump is off or in sensor-loss fallback. This
+   add-on reads that value each cycle and divides the net thermal load by
+   it. When `hp.cop` is `null`, it falls back to the last live value it
+   *has* seen (`heat_pump_cop_source: "last_known"`), and only falls back
+   to the static `heat_pump_cop` option (`"default"`) if QSH has never
+   reported a live COP at all. A flat, config-supplied COP is no longer the
+   normal path — it's purely the cold-start/always-off fallback.
+
+If you'd rather judge whether QSH's thermal forecast itself is trustworthy
+(independent of COP), QSH's author gives this check:
+
+```
+U_total (kW/K) = Load_4h ÷ Σ (T_target − OAT_h), for h = the next 4 hours
+```
+
+1. Read `Load_4h` (`forecast_load_kwh_thermal_gross` → `4` — use the gross,
+   pre-solar-netting figure here, since the formula's own `Σ (T_target −
+   OAT_h)` denominator is a pure conduction term with no solar in it; or
+   read it from the Forecast State panel in QSH's own UI). If unavailable, a
+   zone has no temperature sensor or hasn't learned its U yet.
+2. `T_target` = the plain mean of each room's current target temperature
+   (unweighted — QSH doesn't weight by area).
+3. `OAT_h` = the first 4 points of QSH's "Hourly OAT (next 6h)" forecast
+   (`hourly_temps_first_6` on `<prefix>_heat_energy`), not your outdoor
+   sensor.
+4. Sum `(T_target − OAT_h)` over those 4 hours (units: K·h), then divide
+   `Load_4h` by that sum to get `U_total`.
+5. Compare against your design value,
+   `U_design (kW/K) = design heat loss (kW) ÷ (design indoor temp − design outdoor temp)`,
+   from your MCS survey. `U_total ÷ U_design ≈ 1` means the survey and
+   QSH's sys-id agree; well off 1 means either the survey was wrong or QSH's
+   sys-id hasn't matured yet (see "QSH still calibrating" below).
+
+This add-on does not compute `U_total` for you today — the raw inputs
+(`forecast_load_kwh_thermal_gross`, `hourly_temps_first_6`) are published so
+you can do it in a Home Assistant template sensor if you want to track it.
 
 The `<prefix>_heat_energy` sensor also carries a `raw_snapshot` attribute
 with QSH's full `forecast_state_snapshot` payload, unmodified — use it in
