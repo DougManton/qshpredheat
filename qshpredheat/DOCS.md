@@ -27,21 +27,27 @@ accurate, provided QSH is already deployed and controlling your heat pump.
 | `log_level` | `info` | `debug` / `info` / `warning` / `error` |
 | `heat_pump_cop` | `3.0` | Fallback coefficient of performance, used only when QSH has never yet reported a live COP (fresh install, heat pump always off/sensor-loss so far). Normally this add-on reads COP from QSH itself — see [Thermal vs electrical kWh](#thermal-vs-electrical-kwh) below. |
 | `sysid_poll_interval` | `300` | Seconds between polls of QSH's `/api/sysid` for the confidence summary — see [Forecast confidence](#forecast-confidence) below. Observation counts only grow over many control cycles, so this doesn't need to track the `/ws/live` forecast cadence. |
+| `weather_entity` | `""` | A Home Assistant weather entity (e.g. `weather.home`) used to shape the demand curve with real hour-by-hour temperature beyond QSH's own 6h forecast — see [Demand curve shaping](#demand-curve-shaping) below. Leave blank to disable (no cost; this option is a strict opt-in). |
+| `weather_poll_interval` | `1800` | Seconds between polls of `weather_entity`'s hourly forecast. Weather forecasts update far less often than `/ws/live`'s forecast cadence, so this doesn't need to be frequent. |
 
 ## Entities created
 
 - `<prefix>_heat_energy` — state is the furthest-out forecast total, in
   **electrical** kWh (solar-netted thermal kWh ÷ COP); carries an `external`
   attribute (list of `{last_updated, energy}` points, cumulative electrical
-  kWh from now) built by linearly interpolating between whatever
-  `forecast_load_kwh_<N>h` checkpoints QSH reports (commonly 4h/12h/24h).
-  Point this at Predbat's `load_forecast:` config in place of
+  kWh from now) built by interpolating between whatever `forecast_load_kwh_<N>h`
+  checkpoints QSH reports (commonly 4h/12h/24h), shaped hour-by-hour within
+  each checkpoint window by temperature — see
+  [Demand curve shaping](#demand-curve-shaping) below. Point this at
+  Predbat's `load_forecast:` config in place of
   `predheat.heat_energy$external`. Also carries, as attributes:
   `forecast_load_kwh_thermal_gross` (QSH's raw, unconverted thermal values),
   `forecast_load_kwh_thermal_net_of_solar` (after solar netting, still
   thermal), `solar_netted_kwh` and `solar_netting_partial_checkpoints` (see
-  below), and `heat_pump_cop` / `heat_pump_cop_source` (the divisor used and
-  where it came from: `live`, `last_known`, or `default`).
+  below), `heat_pump_cop` / `heat_pump_cop_source` (the divisor used and
+  where it came from: `live`, `last_known`, or `default`), and
+  `demand_curve_shaped_hours` / `weather_entity` (which hours of the curve
+  got real temperature shaping, and from where).
 - `<prefix>_forecast_load_kwh_<N>h` — one sensor per checkpoint QSH reports,
   in electrical kWh; each carries the corresponding `thermal_kwh_gross` /
   `thermal_kwh_net_of_solar` / `heat_pump_cop` / `heat_pump_cop_source`
@@ -154,6 +160,45 @@ to every `<prefix>_heat_energy` publish (`forecast_confidence` /
 produced once rooms have matured. This is a count-of-evidence signal only —
 it says nothing about whether the *learned* U value is numerically close to
 reality, which is what the `U_total`/`U_design` cross-check above is for.
+
+## Demand curve shaping
+
+QSH only gives a handful of checkpoints (commonly 4h/12h/24h), so turning
+those into the minute-by-minute `external` series Predbat reads requires
+interpolating between them somehow. Pure linear interpolation (this add-on's
+original behaviour) assumes a flat demand rate across each whole checkpoint
+window — so a window spanning, say, midnight to noon gets the same assumed
+rate overnight (when it's coldest and demand is highest) as mid-morning,
+even though the window's *total* energy (from QSH) is correct.
+
+This add-on now shapes the curve within each checkpoint window by an
+hour-by-hour temperature-deficit weight — `max(0, T_target_mean − OAT_h)`
+for each hour `h` — so a colder hour gets a larger share of that window's
+energy and a milder hour gets less. Each window's own total always still
+matches QSH's checkpoint figure exactly; only the shape *within* it changes.
+`T_target_mean` is the mean of each room's current target temperature, from
+the same `/ws/live` message (no extra request needed). The hourly
+temperature itself comes from two sources, by hour:
+
+- **Hours 0-5**: QSH's own `hourly_temps_first_6`, since that's presumably
+  the same OAT series QSH's forecast engine integrated against internally.
+- **Hours 6 onward**: the `weather_entity` option, if configured — polled
+  every `weather_poll_interval` seconds via Home Assistant's
+  `weather.get_forecasts` action (`type: hourly`), the same mechanism HA's
+  own automations use to read a weather integration's hourly forecast.
+  Point it at whatever weather entity you'd normally use for this (e.g.
+  `weather.home`); it must support an hourly forecast (not just daily) for
+  this to have any effect beyond hour 6.
+
+Any hour with no data from either source — `weather_entity` left blank, the
+weather call failing, or room target temperatures unavailable — falls back
+to an equal share for that hour, which is mathematically identical to the
+old flat behaviour. There's no partial-failure risk: shaping is strictly
+additive on top of the existing totals, never a replacement for them.
+`<prefix>_heat_energy`'s `demand_curve_shaped_hours` attribute lists exactly
+which hours (0-indexed, from now) got real temperature shaping on a given
+cycle, so you can confirm it's working rather than guessing from the curve
+shape alone.
 
 ### Forecast confidence blocked (403)
 

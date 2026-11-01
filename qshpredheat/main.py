@@ -22,6 +22,16 @@ electrical draw. Before publishing it for Predbat this script:
 The original (gross, thermal, pre-solar) figures are kept available as
 attributes (forecast_load_kwh_thermal / thermal_kwh) for reference.
 
+The "external" cumulative series is also shaped within each QSH checkpoint
+window by hour-of-day temperature, instead of a flat rate across the whole
+window: QSH's own hourly_temps_first_6 covers hours 0-5, and the configured
+`weather_entity` option (polled via HA's weather.get_forecasts action)
+covers hours beyond that, so an overnight temperature dip inside a window
+gets correctly more of that window's energy rather than being averaged flat
+across it. Each window's own total always matches QSH's checkpoint exactly;
+only the shape within it changes. With no weather_entity configured, or
+missing room-target data, this degrades to the old flat behaviour exactly.
+
 Separately, this script polls QSH's /api/sysid on its own slower cadence
 (SYSID_POLL_INTERVAL) and attaches a confidence summary (the worst per-room
 confidence badge QSH itself reports, which rooms are the bottleneck, their
@@ -64,6 +74,8 @@ RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "5"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
 HEAT_PUMP_COP = float(os.environ.get("HEAT_PUMP_COP", "3.0"))
 SYSID_POLL_INTERVAL = int(os.environ.get("SYSID_POLL_INTERVAL", "300"))
+WEATHER_ENTITY = os.environ.get("WEATHER_ENTITY", "").strip()
+WEATHER_POLL_INTERVAL = int(os.environ.get("WEATHER_POLL_INTERVAL", "1800"))
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN")
 HA_API_BASE = "http://supervisor/core/api"
@@ -214,6 +226,135 @@ async def poll_sysid_loop():
         await asyncio.sleep(SYSID_POLL_INTERVAL)
 
 
+# Most recent hourly forecast from the configured HA weather_entity, as a
+# list of (datetime, temperature_c) tuples — absolute times, so hour-offset-
+# from-now is recomputed fresh at build time rather than going stale between
+# polls. Empty/unset whenever WEATHER_ENTITY is "" or the fetch has failed.
+_latest_weather_points = []
+_last_weather_error = None
+
+
+def fetch_weather_hourly():
+    """Calls Home Assistant's weather.get_forecasts action for WEATHER_ENTITY
+    (type=hourly) via HA Core's REST API, the same one ha_set_state already
+    talks to. Returns (forecast_list, error); exactly one is None."""
+    if not SUPERVISOR_TOKEN:
+        return None, "no_token"
+    url = f"{HA_API_BASE}/services/weather/get_forecasts?return_response"
+    headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
+    try:
+        resp = requests.post(url, headers=headers, json={"entity_id": WEATHER_ENTITY, "type": "hourly"}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        forecast = (data.get("service_response") or {}).get(WEATHER_ENTITY, {}).get("forecast")
+        if not isinstance(forecast, list):
+            return None, "unexpected_response"
+        return forecast, None
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        return None, f"http_{status}"
+    except requests.RequestException:
+        return None, "unreachable"
+
+
+def parse_weather_forecast(forecast):
+    """Extract (datetime, temperature_c) points from a weather.get_forecasts
+    hourly response, skipping any entry missing/malformed datetime or
+    temperature."""
+    points = []
+    for entry in forecast:
+        if not isinstance(entry, dict):
+            continue
+        dt_str = entry.get("datetime")
+        temp = entry.get("temperature")
+        if not isinstance(dt_str, str) or not isinstance(temp, (int, float)) or isinstance(temp, bool):
+            continue
+        try:
+            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        points.append((dt, float(temp)))
+    return points
+
+
+async def poll_weather_loop():
+    """Refreshes _latest_weather_points from WEATHER_ENTITY's hourly forecast
+    on its own slower cadence — a no-op (never polls) when weather_entity
+    isn't configured, so this is a strict opt-in with no cost otherwise."""
+    global _latest_weather_points, _last_weather_error
+    if not WEATHER_ENTITY:
+        log.info(
+            "weather_entity not configured: demand-curve shaping limited to "
+            "QSH's own first-6h hourly forecast; hours beyond that use flat "
+            "interpolation between QSH's checkpoints, as before."
+        )
+        return
+    while True:
+        forecast, error = await asyncio.to_thread(fetch_weather_hourly)
+        if error is not None:
+            if error != _last_weather_error:
+                log.warning(
+                    "Failed to fetch hourly forecast from weather.get_forecasts(%s): %s. "
+                    "Demand-curve shaping beyond QSH's first 6h will fall back to flat "
+                    "interpolation until this recovers.",
+                    WEATHER_ENTITY, error,
+                )
+                _last_weather_error = error
+            else:
+                log.debug("weather.get_forecasts(%s) still failing (%s)", WEATHER_ENTITY, error)
+        else:
+            _last_weather_error = None
+            _latest_weather_points = parse_weather_forecast(forecast)
+            log.debug("Fetched %d hourly forecast points from %s", len(_latest_weather_points), WEATHER_ENTITY)
+        await asyncio.sleep(WEATHER_POLL_INTERVAL)
+
+
+def compute_hourly_weights(snapshot, payload, max_hour):
+    """Approximate degree-hour demand weight per hour-of-forecast, so
+    build_external_series can shape *within* QSH's checkpoints instead of
+    just interpolating flatly between them. Weight for hour h is
+    max(0, T_target_mean - OAT_h): a colder hour gets more of that window's
+    energy. Hours 0-5 prefer QSH's own hourly_temps_first_6 (the OAT series
+    QSH's own forecast engine presumably integrated against); hours beyond
+    that fall back to the configured weather_entity's hourly forecast, if
+    any. Hours covered by neither are left out of the dict entirely — the
+    caller treats a missing hour as weight 1.0 (flat), not 0.
+
+    Returns {} (meaning: shape nothing, fully flat) whenever room target
+    temperatures aren't available, since the weighting is meaningless
+    without them."""
+    rooms = payload.get("rooms")
+    if not isinstance(rooms, dict) or not rooms:
+        return {}
+    targets = [
+        r.get("target") for r in rooms.values()
+        if isinstance(r, dict) and isinstance(r.get("target"), (int, float)) and not isinstance(r.get("target"), bool)
+    ]
+    if not targets:
+        return {}
+    t_target_mean = sum(targets) / len(targets)
+
+    weights = {}
+    hourly_temps = snapshot.get("hourly_temps_first_6") or []
+    for hour, temp in enumerate(hourly_temps):
+        if hour >= max_hour:
+            break
+        if isinstance(temp, (int, float)) and not isinstance(temp, bool):
+            weights[hour] = max(0.0, t_target_mean - temp)
+
+    if _latest_weather_points:
+        now = datetime.now(timezone.utc)
+        for dt, temp in _latest_weather_points:
+            hour = int((dt - now).total_seconds() // 3600)
+            if hour in weights or hour < 0 or hour >= max_hour:
+                continue
+            weights[hour] = max(0.0, t_target_mean - temp)
+
+    return weights
+
+
 def resolve_cop(payload):
     """Return (cop, source) where source is "live", "last_known", or
     "default". QSH's own "hp.cop" is null-preserving (null when the heat
@@ -271,11 +412,20 @@ def ha_set_state(entity_id, state, attributes=None):
         log.error("Failed to set %s: %s", entity_id, exc)
 
 
-def build_external_series(anchors_hours_kwh, step_minutes=10):
+def build_external_series(anchors_hours_kwh, hourly_weights=None, step_minutes=10):
     """Piecewise-linear interpolation of cumulative kWh between QSH's
     forecast checkpoints (e.g. 4h/12h/24h), in predheat's "external"
     attribute shape: a list of {last_updated, energy} dicts timestamped
-    from now, with energy as cumulative kWh since now."""
+    from now, with energy as cumulative kWh since now.
+
+    hourly_weights, from compute_hourly_weights, reshapes *within* each
+    checkpoint window: each window's own total energy is preserved exactly
+    (so this never disagrees with QSH's own checkpoint figures), but it's
+    split across that window's hours proportional to hourly_weights (a
+    missing hour defaults to weight 1.0, i.e. flat) instead of split evenly
+    across the whole window. With hourly_weights=None/{} this is
+    mathematically identical to the old pure-linear-between-checkpoints
+    behaviour."""
     now = datetime.now(timezone.utc)
     points = sorted(anchors_hours_kwh, key=lambda p: p[0])
     if not points or points[0][0] != 0:
@@ -285,15 +435,39 @@ def build_external_series(anchors_hours_kwh, step_minutes=10):
     if max_hour <= 0:
         return []
 
+    hourly_weights = hourly_weights or {}
+
+    # Expand QSH's few checkpoints into hourly breakpoints, each window's
+    # energy split per compute_hourly_weights instead of spread flat across
+    # the whole window.
+    hour_points = [(0.0, 0.0)]
+    cumulative = 0.0
+    for i in range(len(points) - 1):
+        lo_hour, lo_kwh = points[i]
+        hi_hour, hi_kwh = points[i + 1]
+        span_kwh = hi_kwh - lo_kwh
+        lo_i, hi_i = int(lo_hour), int(hi_hour)
+        hours_in_span = list(range(lo_i, hi_i)) or [lo_i]
+        span_weights = [max(hourly_weights.get(h, 1.0), 0.0) for h in hours_in_span]
+        total_weight = sum(span_weights)
+        if total_weight <= 0:
+            span_weights = [1.0] * len(hours_in_span)
+            total_weight = float(len(hours_in_span))
+        for h, w in zip(hours_in_span, span_weights):
+            cumulative += span_kwh * (w / total_weight)
+            hour_points.append((float(h + 1), cumulative))
+    # Correct float drift so the series still ends exactly on QSH's total.
+    hour_points[-1] = (hour_points[-1][0], points[-1][1])
+
     series = []
     minute = 0
     total_minutes = max_hour * 60
     while minute <= total_minutes:
         hour = minute / 60.0
-        lo, hi = points[0], points[-1]
-        for i in range(len(points) - 1):
-            if points[i][0] <= hour <= points[i + 1][0]:
-                lo, hi = points[i], points[i + 1]
+        lo, hi = hour_points[0], hour_points[-1]
+        for i in range(len(hour_points) - 1):
+            if hour_points[i][0] <= hour <= hour_points[i + 1][0]:
+                lo, hi = hour_points[i], hour_points[i + 1]
                 break
         if hi[0] == lo[0]:
             energy = lo[1]
@@ -346,7 +520,8 @@ def handle_snapshot(payload):
     loads = {hours: kwh / cop for hours, kwh in loads_net_thermal.items()}
 
     anchors = [(0.0, 0.0)] + sorted(loads.items())
-    external_series = build_external_series(anchors) if len(anchors) > 1 else []
+    hourly_weights = compute_hourly_weights(snapshot, payload, int(anchors[-1][0])) if len(anchors) > 1 else {}
+    external_series = build_external_series(anchors, hourly_weights) if len(anchors) > 1 else []
 
     total_furthest = loads.get(max(loads)) if loads else None
     solar_12h = snapshot.get("solar_kwh_12h")
@@ -374,6 +549,8 @@ def handle_snapshot(payload):
             "hourly_solar_first_6": snapshot.get("hourly_solar_first_6"),
             "forecast_confidence": _latest_confidence.get("overall") if _latest_confidence else "unknown",
             "forecast_confidence_detail": _latest_confidence,
+            "demand_curve_shaped_hours": sorted(hourly_weights.keys()),
+            "weather_entity": WEATHER_ENTITY or None,
             "raw_snapshot": snapshot,
         },
     )
@@ -429,7 +606,7 @@ async def run_ws():
 
 
 async def run():
-    await asyncio.gather(run_ws(), poll_sysid_loop())
+    await asyncio.gather(run_ws(), poll_sysid_loop(), poll_weather_loop())
 
 
 if __name__ == "__main__":

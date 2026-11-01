@@ -9,6 +9,8 @@ export RECONNECT_DELAY=$(bashio::config 'reconnect_delay')
 export LOG_LEVEL=$(bashio::config 'log_level')
 export HEAT_PUMP_COP=$(bashio::config 'heat_pump_cop')
 export SYSID_POLL_INTERVAL=$(bashio::config 'sysid_poll_interval' '300')
+export WEATHER_ENTITY=$(bashio::config 'weather_entity' '')
+export WEATHER_POLL_INTERVAL=$(bashio::config 'weather_poll_interval' '1800')
 
 bashio::log.info "Starting QSH Predheat Bridge, connecting to ${QSH_SCHEME}://${QSH_HOST}:${QSH_PORT}/ws/live"
 

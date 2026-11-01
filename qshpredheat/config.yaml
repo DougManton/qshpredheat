@@ -1,5 +1,5 @@
 name: "QSH Predheat Bridge"
-version: "0.1.8"
+version: "0.1.9"
 slug: "qshpredheat"
 description: "Bridges QSH (Quantum Storm Heating) forward heat-demand/solar forecasts into Home Assistant sensors, in the same shape Predbat's load_forecast expects from predheat"
 url: "https://github.com/DougManton/qshpredheat"
@@ -24,6 +24,8 @@ options:
   log_level: "info"
   heat_pump_cop: 3.0
   sysid_poll_interval: 300
+  weather_entity: ""
+  weather_poll_interval: 1800
 schema:
   qsh_host: "str"
   qsh_port: "port"
@@ -33,3 +35,5 @@ schema:
   log_level: "list(debug|info|warning|error)"
   heat_pump_cop: "float(0.5,10.0)"
   sysid_poll_interval: "int(30,3600)?"
+  weather_entity: "str?"
+  weather_poll_interval: "int(60,7200)?"

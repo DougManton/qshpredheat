@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.9
+
+- Added demand-curve shaping: the `external` series published for Predbat
+  no longer assumes a flat demand rate across each of QSH's checkpoint
+  windows (4h/12h/24h). It now splits each window's energy across its hours
+  proportional to a temperature-deficit weight (`T_target_mean - OAT_h`),
+  using QSH's own `hourly_temps_first_6` for hours 0-5 and a new optional
+  `weather_entity` option (polled via HA's `weather.get_forecasts` action)
+  for hours 6+, so an overnight temperature dip gets correctly more of its
+  window's energy instead of being averaged flat across the whole window.
+  Each window's own total still matches QSH's checkpoint exactly — only the
+  shape within it changes. With no `weather_entity` configured (default) or
+  missing room-target data, this is mathematically identical to the
+  previous flat-interpolation behaviour; new `weather_poll_interval` option
+  (default 1800s) controls the poll cadence. New `demand_curve_shaped_hours`
+  / `weather_entity` attributes on `<prefix>_heat_energy` show which hours
+  got real shaping on a given cycle.
+
 ## 0.1.8
 
 - Fixed `Failed to save: Missing option 'sysid_poll_interval' in root` when
