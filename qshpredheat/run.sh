@@ -10,6 +10,7 @@ export LOG_LEVEL=$(bashio::config 'log_level')
 export HEAT_PUMP_COP=$(bashio::config 'heat_pump_cop' '3.0')
 export COP_ENTITY=$(bashio::config 'cop_entity' '')
 export COP_POLL_INTERVAL=$(bashio::config 'cop_poll_interval' '3600')
+export ENABLE_SOLAR_NETTING=$(bashio::config 'enable_solar_netting' 'true')
 export WEATHER_ENTITY=$(bashio::config 'weather_entity' '')
 export WEATHER_POLL_INTERVAL=$(bashio::config 'weather_poll_interval' '1800')
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.12
+
+- Added `enable_solar_netting` option (default `true`). QSH's own solar
+  forecast was observed on a live install producing physically implausible
+  numbers — `hourly_solar_first_6` flat across all 6 hours including hours
+  already past sunset, and a large `solar_kwh_12h` total on a day with
+  almost no sun — confirmed as a bug in QSH's own forecast ingestion (its
+  Forecast State panel showed the identical wrong numbers) rather than
+  anything introduced by this add-on, and confirmed the underlying weather
+  data feeding QSH was itself correct and varying. Since a wrong solar
+  figure gets subtracted from real demand, this silently understates the
+  forecast rather than just looking odd — set `enable_solar_netting: false`
+  to fall back to QSH's gross thermal load unadjusted when this is
+  suspected, until QSH's own forecast ingestion is fixed. New
+  `solar_netting_enabled` attribute on `<prefix>_heat_energy` shows which
+  mode is active.
+
 ## 0.1.11
 
 - **Reverted 0.1.10's `/api/scop` polling.** It hit the same

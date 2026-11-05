@@ -10,8 +10,19 @@ QSH's forecast_load_kwh_<N>h is gross fabric heat loss in thermal kWh: it
 has not been netted against solar gain, and it is not the heat pump's
 electrical draw. Before publishing it for Predbat this script:
 
-  1. Nets off QSH's own solar forecast (hourly_solar_first_6 /
-     solar_kwh_12h) from the thermal load, floored at zero.
+  1. Optionally nets off QSH's own solar forecast (hourly_solar_first_6 /
+     solar_kwh_12h) from the thermal load, floored at zero — controlled by
+     `enable_solar_netting` (default on). This is a real opt-out, not just
+     a cosmetic one: QSH's own solar forecast has been observed producing
+     physically implausible numbers (e.g. a flat, non-tapering hourly curve
+     straight through sunset, or a large solar-gain total on an overcast
+     day) traced to QSH's own forecast ingestion, not this add-on or the
+     underlying weather data — confirmed by comparing against QSH's own
+     Forecast State panel (same wrong numbers there) and the live weather
+     entity/outdoor sensor underneath it (correct and varying). When QSH's
+     solar forecast can't be trusted, set `enable_solar_netting: false` to
+     fall back to the gross thermal load untouched, rather than silently
+     under-stating demand by netting off solar that doesn't exist.
   2. Divides by a COP to convert thermal kWh to electrical kWh. A live,
      instantaneous COP is not representative of what will apply over a 24h
      *forecast* (it depends on this instant's flow/outdoor temp, not
@@ -81,6 +92,7 @@ QSH_SCHEME = os.environ.get("QSH_SCHEME", "ws")
 ENTITY_PREFIX = os.environ.get("ENTITY_PREFIX", "sensor.qsh")
 RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY", "5"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
+ENABLE_SOLAR_NETTING = os.environ.get("ENABLE_SOLAR_NETTING", "true").strip().lower() not in ("false", "0", "no")
 HEAT_PUMP_COP = float(os.environ.get("HEAT_PUMP_COP", "3.0"))
 COP_ENTITY = os.environ.get("COP_ENTITY", "").strip()
 COP_POLL_INTERVAL = int(os.environ.get("COP_POLL_INTERVAL", "3600"))
@@ -445,10 +457,16 @@ def handle_snapshot(payload):
         )
 
     # QSH's forecast_load_kwh_<N>h is gross fabric heat loss (thermal kWh):
-    # net off QSH's own solar forecast, then convert to electrical kWh using
-    # a rolling COP from cop_entity (falling back to the configured default)
-    # — Predbat's load_forecast expects electrical kWh.
-    loads_net_thermal, solar_netted, partial_solar_checkpoints = net_solar(loads_thermal, snapshot)
+    # net off QSH's own solar forecast (unless disabled — see module
+    # docstring), then convert to electrical kWh using a rolling COP from
+    # cop_entity (falling back to the configured default) — Predbat's
+    # load_forecast expects electrical kWh.
+    if ENABLE_SOLAR_NETTING:
+        loads_net_thermal, solar_netted, partial_solar_checkpoints = net_solar(loads_thermal, snapshot)
+    else:
+        loads_net_thermal = dict(loads_thermal)
+        solar_netted = {hours: 0.0 for hours in loads_thermal}
+        partial_solar_checkpoints = []
     cop, cop_source = resolve_cop()
     loads = {hours: kwh / cop for hours, kwh in loads_net_thermal.items()}
 
@@ -472,6 +490,7 @@ def handle_snapshot(payload):
             "forecast_load_kwh_thermal_net_of_solar": loads_net_thermal,
             "solar_netted_kwh": solar_netted,
             "solar_netting_partial_checkpoints": partial_solar_checkpoints,
+            "solar_netting_enabled": ENABLE_SOLAR_NETTING,
             "heat_pump_cop": cop,
             "heat_pump_cop_source": cop_source,
             "cop_entity": COP_ENTITY or None,
@@ -537,6 +556,8 @@ async def run_ws():
 
 
 async def run():
+    if not ENABLE_SOLAR_NETTING:
+        log.info("enable_solar_netting is false: publishing QSH's gross thermal load unadjusted for solar.")
     await asyncio.gather(run_ws(), poll_weather_loop(), poll_cop_loop())
 
 

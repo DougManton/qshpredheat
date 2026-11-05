@@ -44,6 +44,7 @@ accurate, provided QSH is already deployed and controlling your heat pump.
 | `cop_poll_interval` | `3600` | Seconds between reads of `cop_entity`. A rolling average moves slowly, so this doesn't need to be frequent. |
 | `weather_entity` | `""` | A Home Assistant weather entity (e.g. `weather.home`) used to shape the demand curve with real hour-by-hour temperature beyond QSH's own 6h forecast — see [Demand curve shaping](#demand-curve-shaping) below. Leave blank to disable (no cost; this option is a strict opt-in). |
 | `weather_poll_interval` | `1800` | Seconds between polls of `weather_entity`'s hourly forecast. Weather forecasts update far less often than `/ws/live`'s forecast cadence, so this doesn't need to be frequent. |
+| `enable_solar_netting` | `true` | Set to `false` to stop netting QSH's solar forecast off the thermal load entirely, publishing the gross thermal load (converted to electrical) unadjusted. See [Thermal vs electrical kWh](#thermal-vs-electrical-kwh) below — QSH's own solar forecast has been observed producing physically implausible numbers on at least one install. |
 
 ## Entities created
 
@@ -58,8 +59,10 @@ accurate, provided QSH is already deployed and controlling your heat pump.
   `predheat.heat_energy$external`. Also carries, as attributes:
   `forecast_load_kwh_thermal_gross` (QSH's raw, unconverted thermal values),
   `forecast_load_kwh_thermal_net_of_solar` (after solar netting, still
-  thermal), `solar_netted_kwh` and `solar_netting_partial_checkpoints` (see
-  below), `heat_pump_cop` / `heat_pump_cop_source` (the divisor used and
+  thermal — identical to the gross figure when `enable_solar_netting` is
+  `false`), `solar_netted_kwh`, `solar_netting_enabled`, and
+  `solar_netting_partial_checkpoints` (see below), `heat_pump_cop` /
+  `heat_pump_cop_source` (the divisor used and
   where it came from: `cop_entity`, `last_known`, or `default`), `cop_entity`
   (which entity, if any), and `demand_curve_shaped_hours` / `weather_entity`
   (which hours of the curve got real temperature shaping, and from where).
@@ -78,23 +81,41 @@ electricity the heat pump will draw to replace it. Predbat's
 `load_forecast` expects electrical kWh (it's forecasting what the
 battery/grid will need to supply), so before publishing, this add-on:
 
-1. **Nets off solar gain.** QSH reports fabric heat loss and solar gain as
-   two separate figures (`forecast_load_kwh_<N>h` and
-   `solar_kwh_12h`/`hourly_solar_first_6`) rather than a solar-adjusted
-   load — so unless something nets them against each other, solar isn't
-   actually accounted for anywhere, despite it being the whole reason to
-   prefer QSH's forecast over `predheat`'s no-solar-gain model (see "Why"
-   above). This add-on now does that netting itself: for the 4h checkpoint
-   it subtracts the first 4 values of `hourly_solar_first_6`; for 12h it
-   subtracts `solar_kwh_12h` directly; for any checkpoint beyond 12h (e.g.
-   24h) it can only subtract the 12h solar total, since QSH's `/ws/live`
-   feed carries no solar forecast beyond 12h — the result for a >12h
-   checkpoint therefore under-nets the true solar offset for the hours past
-   12h. Checkpoints netted this way are listed in
-   `solar_netting_partial_checkpoints`. Each net figure is floored at 0 (a
-   sunny-enough window can't produce negative heating demand in this
+1. **Nets off solar gain (unless `enable_solar_netting` is `false`).** QSH
+   reports fabric heat loss and solar gain as two separate figures
+   (`forecast_load_kwh_<N>h` and `solar_kwh_12h`/`hourly_solar_first_6`)
+   rather than a solar-adjusted load — so unless something nets them against
+   each other, solar isn't actually accounted for anywhere, despite it being
+   the whole reason to prefer QSH's forecast over `predheat`'s no-solar-gain
+   model (see "Why" above). By default this add-on does that netting itself:
+   for the 4h checkpoint it subtracts the first 4 values of
+   `hourly_solar_first_6`; for 12h it subtracts `solar_kwh_12h` directly;
+   for any checkpoint beyond 12h (e.g. 24h) it can only subtract the 12h
+   solar total, since QSH's `/ws/live` feed carries no solar forecast beyond
+   12h — the result for a >12h checkpoint therefore under-nets the true
+   solar offset for the hours past 12h. Checkpoints netted this way are
+   listed in `solar_netting_partial_checkpoints`. Each net figure is floored
+   at 0 (a sunny-enough window can't produce negative heating demand in this
    approximation). The un-netted gross values stay available as
    `forecast_load_kwh_thermal_gross` for comparison.
+
+   **This assumes QSH's own solar forecast is trustworthy, which isn't
+   guaranteed.** On at least one install, QSH's `hourly_solar_first_6` was
+   observed flat (the same value repeated across all 6 hours, including
+   hours already past sunset) and `solar_kwh_12h` was a large figure on a
+   day with almost no sun — confirmed as QSH's own bug (QSH's Forecast State
+   panel showed the identical wrong numbers) rather than anything this
+   add-on introduced, and confirmed the underlying weather data feeding QSH
+   was itself fine (a live, correctly-varying temperature sensor and weather
+   entity). A bad solar figure doesn't just look odd in isolation — it gets
+   subtracted from real demand, so it silently *understates* the forecast.
+   If you see implausible solar figures (flat hourly values spanning
+   daylight and dark hours, or large totals on an overcast day), cross-check
+   against QSH's own Forecast State panel to confirm it's QSH's own
+   forecast and not something this add-on is doing, and if so, set
+   `enable_solar_netting: false` until QSH's forecast ingestion is fixed —
+   this falls back to the gross thermal load, trading away solar-awareness
+   for not silently under-stating demand.
 2. **Converts thermal kWh to electrical kWh using a rolling-average COP,
    not a live/instantaneous one.** A live COP reading (QSH's `/ws/live`
    feed does carry one, in `hp.cop`) reflects this instant's flow/outdoor
